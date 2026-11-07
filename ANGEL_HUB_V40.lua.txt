@@ -1,0 +1,357 @@
+--====================================================
+-- ANGEL HUB V40 | RAYFIELD GEN2 + AUTO VENDER (VEL 30)
+--====================================================
+
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+local Config = {
+    AutoFarm = false, AutoFish = false, AutoSkip = false,
+    AutoRecoger = false, AutoSell = false, AutoEquip = true,
+    WalkSpeed = 22, SellWalkSpeed = 30, CleanTime = 5,
+    SavedFishingPos = nil, SavedShopPos = nil, MaxFish = 12,
+    Running = false, FishingRunning = false, IsSelling = false
+}
+
+local Character, Humanoid, Root
+local OriginalSpeed = 16
+local Visited = {}
+
+local function UpdateCharacter()
+    Character = Player.Character or Player.CharacterAdded:Wait()
+    Humanoid = Character:WaitForChild("Humanoid")
+    Root = Character:WaitForChild("HumanoidRootPart")
+    OriginalSpeed = Humanoid.WalkSpeed
+    Visited = {}
+end
+UpdateCharacter()
+Player.CharacterAdded:Connect(function()
+    Config.AutoFarm = false; Config.AutoFish = false
+    Config.AutoRecoger = false; Config.AutoSell = false
+    Config.IsSelling = false
+    task.wait(1); UpdateCharacter()
+end)
+
+local function FindTool(keywords)
+    if not Character then return nil end
+    for _, tool in ipairs(Character:GetChildren()) do
+        if tool:IsA("Tool") then
+            local n = tool.Name:lower()
+            for _, kw in ipairs(keywords) do if n:find(kw) then return tool end end
+        end
+    end
+    for _, tool in ipairs(Player.Backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            local n = tool.Name:lower()
+            for _, kw in ipairs(keywords) do if n:find(kw) then return tool end end
+        end
+    end
+    return nil
+end
+local function EquipTool(tool)
+    if tool and tool.Parent ~= Character then
+        pcall(function() Humanoid:EquipTool(tool) end); task.wait(0.2)
+    end
+    return tool
+end
+
+local function CountFishInInventory()
+    local count = 0
+    pcall(function()
+        for _, item in ipairs(Player.Backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                local n = item.Name:lower()
+                if n:find("fish") or n:find("pez") or n:find("catch") then count = count + 1 end
+            end
+        end
+        for _, item in ipairs(Character:GetChildren()) do
+            if item:IsA("Tool") then
+                local n = item.Name:lower()
+                if n:find("fish") or n:find("pez") or n:find("catch") then count = count + 1 end
+            end
+        end
+    end)
+    return count
+end
+
+local function ClickButton(btn)
+    pcall(function()
+        local pos = btn.AbsolutePosition + btn.AbsoluteSize/2
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        task.wait(0.08)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+end
+
+local function MoveTo(pos)
+    if not Root or not Humanoid then return false end
+    local path = PathfindingService:CreatePath({AgentRadius=2, AgentHeight=5, AgentCanJump=true})
+    local ok = pcall(function() path:ComputeAsync(Root.Position, pos) end)
+    if not ok or path.Status ~= Enum.PathStatus.Success then return false end
+    for _, wp in ipairs(path:GetWaypoints()) do
+        if not Config.AutoFarm and not Config.IsSelling then return false end
+        if wp.Action == Enum.PathWaypointAction.Jump then Humanoid.Jump = true end
+        Humanoid:MoveTo(wp.Position)
+        local reached = false
+        local conn = Humanoid.MoveToFinished:Connect(function(r) reached = r end)
+        local t = os.clock()
+        while os.clock() - t < 3.5 and not reached do task.wait(0.1) end
+        conn:Disconnect()
+        if not reached then return false end
+    end
+    return true
+end
+
+local function GoToShopAndSell()
+    if not Config.SavedShopPos or not Config.SavedFishingPos then
+        Rayfield:Notify({Title = "Falta posicion", Content = "Guarda tienda y pesca primero", Duration = 3})
+        return false
+    end
+    Config.IsSelling = true
+    Rayfield:Notify({Title = "Vendiendo...", Content = "Yendo a la tienda (vel 30)", Duration = 3})
+    Humanoid.WalkSpeed = 30
+    MoveTo(Config.SavedShopPos); task.wait(2)
+    Rayfield:Notify({Title = "Vendiendo", Content = "Vendiendo peces...", Duration = 2})
+    pcall(function()
+        for _, gui in ipairs(PlayerGui:GetDescendants()) do
+            if gui:IsA("TextButton") or gui:IsA("ImageButton") then
+                local txt = (gui:IsA("TextButton") and gui.Text or ""):lower()
+                local name = gui.Name:lower()
+                if txt:find("sell") or name:find("sell") or txt:find("vender") or name:find("vender") then
+                    ClickButton(gui); task.wait(1)
+                end
+            end
+        end
+    end)
+    task.wait(1.5)
+    Rayfield:Notify({Title = "Regresando", Content = "Volviendo a pescar (vel 30)", Duration = 3})
+    Humanoid.WalkSpeed = 30
+    MoveTo(Config.SavedFishingPos); task.wait(1)
+    Config.IsSelling = false
+    return true
+end
+
+local function IsBlueZone(part)
+    if not part:IsA("BasePart") then return false end
+    local c = part.Color
+    return c.B > 0.55 and c.B > c.R*1.2 and c.B > c.G*1.05
+        and part.Size.X >= 2 and part.Size.Z >= 2 and part.Size.Y <= 4
+end
+local function GetNearestZone()
+    if not Root then return nil end
+    local nearest, dist = nil, math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if IsBlueZone(obj) and not Visited[obj] then
+            local d = (Root.Position - obj.Position).Magnitude
+            if d < dist then dist = d; nearest = obj end
+        end
+    end
+    return nearest
+end
+local function CleanZone(zone)
+    local mop = FindTool({"mop","trape","clean"})
+    if Config.AutoEquip then EquipTool(mop) end
+    if not mop then return false end
+    local t = os.clock()
+    while Config.AutoFarm and os.clock() - t < Config.CleanTime do
+        pcall(function() mop:Activate() end); task.wait(0.35)
+    end
+    return true
+end
+
+local function StartFarmLoop()
+    if Config.Running then return end
+    Config.Running = true
+    while Config.AutoFarm do
+        task.wait(0.1)
+        if Config.AutoFish or not Character or Humanoid.Health <= 0 then continue end
+        Humanoid.WalkSpeed = Config.WalkSpeed
+        local zone = GetNearestZone()
+        if zone then
+            if MoveTo(zone.Position + Vector3.new(0,1.5,0)) then CleanZone(zone); Visited[zone] = true end
+        else
+            Visited = {}; task.wait(0.8)
+        end
+    end
+    Config.Running = false
+    if Humanoid then Humanoid.WalkSpeed = OriginalSpeed end
+end
+
+local function TrySkip()
+    pcall(function()
+        for _, gui in ipairs(PlayerGui:GetDescendants()) do
+            if (gui:IsA("TextButton") or gui:IsA("ImageButton")) and gui.Visible then
+                local n = gui.Name:lower()
+                local t = gui:IsA("TextButton") and gui.Text:lower() or ""
+                if n:find("skip") or t:find("skip") or n:find("catch") or t:find("catch") then
+                    ClickButton(gui); task.wait(0.3)
+                end
+            end
+        end
+    end)
+end
+
+local function StartSellLoop()
+    task.spawn(function()
+        while task.wait(3) do
+            if Config.AutoFish and Config.AutoSell and not Config.IsSelling then
+                local fc = CountFishInInventory()
+                if fc >= Config.MaxFish and Config.SavedShopPos and Config.SavedFishingPos then
+                    Rayfield:Notify({Title = "Inventario lleno", Content = fc .. " peces - vendiendo (vel 30)", Duration = 3})
+                    GoToShopAndSell(); task.wait(8)
+                end
+            end
+        end
+    end)
+end
+
+local function StartFishingLoop()
+    if Config.FishingRunning then return end
+    Config.FishingRunning = true
+    while Config.AutoFish do
+        task.wait(0.15)
+        if Config.AutoFarm or not Character or Humanoid.Health <= 0 or Config.IsSelling then continue end
+        if Config.SavedFishingPos then
+            local dist = (Root.Position - Config.SavedFishingPos).Magnitude
+            if dist > 6 then MoveTo(Config.SavedFishingPos); task.wait(0.5) end
+        end
+        local rod = FindTool({"rod","cana","fishing"})
+        if rod then
+            EquipTool(rod); task.wait(0.4)
+            pcall(function() rod:Activate() end)
+        end
+        local t = os.clock()
+        while Config.AutoFish and os.clock() - t < 6 and not Config.IsSelling do
+            if Config.AutoSkip then TrySkip() end
+            task.wait(0.25)
+        end
+        task.wait(0.4)
+    end
+    Config.FishingRunning = false
+end
+
+local AR_dentroAntes = false
+local AR_ultimoToque = 0
+local function AR_visible(obj)
+    local actual = obj
+    while actual and actual ~= PlayerGui do
+        if actual:IsA("GuiObject") and not actual.Visible then return false end
+        if actual:IsA("ScreenGui") and not actual.Enabled then return false end
+        actual = actual.Parent
+    end
+    return true
+end
+local function AR_buscar()
+    local verdes, blancas = {}, {}
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if obj:IsA("GuiObject") and obj.BackgroundTransparency < 0.5 and AR_visible(obj) then
+            local c = obj.BackgroundColor3; local s = obj.AbsoluteSize
+            if c.G > 0.65 and c.R < 0.4 and c.B < 0.4 and s.X >= 30 and s.Y >= 8 and s.X > s.Y then
+                table.insert(verdes, obj)
+            end
+            if c.R > 0.8 and c.G > 0.8 and c.B > 0.8 and s.X >= 1 and s.X <= 15 and s.Y >= 10 and s.Y > s.X * 2 then
+                table.insert(blancas, obj)
+            end
+        end
+    end
+    for _, verde in ipairs(verdes) do
+        for _, raya in ipairs(blancas) do
+            local gy = verde.AbsolutePosition.Y + verde.AbsoluteSize.Y/2
+            local ry = raya.AbsolutePosition.Y + raya.AbsoluteSize.Y/2
+            if math.abs(gy - ry) <= math.max(verde.AbsoluteSize.Y, raya.AbsoluteSize.Y) then
+                return verde, raya
+            end
+        end
+    end
+end
+task.spawn(function()
+    while task.wait(0.05) do
+        if Config.AutoRecoger and not Config.IsSelling then
+            pcall(function()
+                local verde, raya = AR_buscar()
+                if not verde or not raya then AR_dentroAntes = false; return end
+                local izq = verde.AbsolutePosition.X
+                local der = izq + verde.AbsoluteSize.X
+                local centro = raya.AbsolutePosition.X + raya.AbsoluteSize.X/2
+                local dentro = centro >= izq and centro <= der
+                if dentro and not AR_dentroAntes and os.clock() - AR_ultimoToque > 0.25 then
+                    AR_ultimoToque = os.clock()
+                    local cam = workspace.CurrentCamera
+                    local x = math.floor(cam.ViewportSize.X * 0.5)
+                    local y = math.floor(cam.ViewportSize.Y * 0.35)
+                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+                end
+                AR_dentroAntes = dentro
+            end)
+        end
+    end
+end)
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+if not Rayfield then warn("Rayfield Gen2 no cargo"); return end
+
+local window = Rayfield:CreateWindow({
+    name = "ANGEL HUB V40",
+    subtitle = "BQM STREETS",
+    sidebarLayout = true,
+})
+
+local FarmTab = window:CreateTab({ name = "AUTO FARM", icon = 93364949241311 })
+FarmTab:CreateToggle({
+    name = "Auto Farm (Trapear)",
+    callback = function(value)
+        Config.AutoFarm = value
+        if value then StartFarmLoop() else
+            Config.Running = false
+            if Humanoid then Humanoid.WalkSpeed = OriginalSpeed end
+        end
+    end,
+})
+FarmTab:CreateSlider({name="WalkSpeed Farm", range={16,60}, increment=1, value=22, callback=function(v) Config.WalkSpeed=v end})
+FarmTab:CreateSlider({name="Tiempo limpieza (s)", range={2,15}, increment=1, value=5, callback=function(v) Config.CleanTime=v end})
+FarmTab:CreateButton({name="Resetear zonas visitadas", callback=function() Visited={}; Rayfield:Notify({Title="Zonas",Content="Reiniciado",Duration=2}) end})
+
+local FishTab = window:CreateTab({ name = "PESCA", icon = 93364949241311 })
+FishTab:CreateToggle({name="Auto Fish", callback=function(value) Config.AutoFish=value; if value then StartFishingLoop() end end})
+FishTab:CreateToggle({name="Auto Skip", callback=function(value) Config.AutoSkip=value end})
+FishTab:CreateToggle({name="Auto Recoger (barra)", callback=function(value) Config.AutoRecoger=value end})
+FishTab:CreateToggle({
+    name="Auto Vender peces (vel 30)",
+    callback=function(value)
+        Config.AutoSell=value
+        if value and (not Config.SavedShopPos or not Config.SavedFishingPos) then
+            Rayfield:Notify({Title="Falta guardar",Content="Guarda posicion de pesca Y de tienda",Duration=4})
+        end
+    end
+})
+FishTab:CreateSlider({name="Max. peces antes de vender", range={5,30}, increment=1, value=12, callback=function(v) Config.MaxFish=v end})
+FishTab:CreateButton({name="Guardar posicion de pesca", callback=function() if Root then Config.SavedFishingPos=Root.Position; Rayfield:Notify({Title="Guardado",Content="Posicion de pesca",Duration=2}) end end})
+FishTab:CreateButton({name="Guardar posicion de tienda", callback=function() if Root then Config.SavedShopPos=Root.Position; Rayfield:Notify({Title="Guardado",Content="Posicion de tienda",Duration=2}) end end})
+FishTab:CreateButton({name="Ir a vender ahora", callback=function()
+    if not Config.SavedShopPos or not Config.SavedFishingPos then
+        Rayfield:Notify({Title="Falta posicion",Content="Guarda tienda y pesca primero",Duration=3}); return
+    end
+    task.spawn(GoToShopAndSell)
+end})
+
+local SettingsTab = window:CreateTab({ name = "AJUSTES", icon = 93364949241311 })
+SettingsTab:CreateToggle({name="Auto Equipar herramientas", callback=function(value) Config.AutoEquip=value end})
+SettingsTab:CreateSlider({name="WalkSpeed al vender", range={16,60}, increment=1, value=30, callback=function(v) Config.SellWalkSpeed=v end})
+SettingsTab:CreateButton({name="Detener todo", callback=function()
+    Config.AutoFarm=false; Config.AutoFish=false; Config.AutoRecoger=false; Config.AutoSell=false
+    Config.AutoSkip=false; Config.IsSelling=false; Config.Running=false; Config.FishingRunning=false
+    if Humanoid then Humanoid.WalkSpeed=OriginalSpeed end
+    Rayfield:Notify({Title="Detenido",Content="Todo apagado",Duration=3})
+end})
+SettingsTab:CreateButton({name="Reiniciar posiciones", callback=function()
+    Config.SavedFishingPos=nil; Config.SavedShopPos=nil; Visited={}
+    Rayfield:Notify({Title="Reiniciado",Content="Posiciones limpiadas",Duration=2})
+end})
+
+StartSellLoop()
+Rayfield:Notify({Title="ANGEL HUB V40",Content="Auto Vender (vel 30) listo",Duration=4})
